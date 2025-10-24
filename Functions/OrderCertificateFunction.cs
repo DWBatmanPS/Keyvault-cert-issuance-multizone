@@ -79,12 +79,26 @@ public class OrderCertificateFunction
             if (new[] { keyVaultName, subscriptionId, resourceGroup, dnsZone }.Any(string.IsNullOrWhiteSpace))
                 return await Fail(req, correlationId, "validation_error", "Missing required environment variables for issuance.");
 
+            string? accountSecretNameBase    = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME");
+            string? accountSecretNameStaging = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_STAGING");
+            string? accountSecretNameProd    = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_PROD");
+
             SecretClient? secretClient = null;
             if (!string.IsNullOrWhiteSpace(keyVaultName) && !string.IsNullOrWhiteSpace(accountSecretName))
                 secretClient = new SecretClient(new Uri($"https://{keyVaultName}.vault.azure.net/"), _credential);
 
-            _logger.LogInformation("Order requested CorrelationId={CorrelationId} domains={Domains} cert={CertName} staging={Staging} dryRun={DryRun}",
-                correlationId, string.Join(",", new[] { primaryDomain }.Concat(additional)), certName, staging, dryRun);
+            var expectedSecretName = staging
+                ? (accountSecretNameStaging ?? (accountSecretNameBase != null ? $"{accountSecretNameBase}-staging" : "blob-fallback"))
+                : (accountSecretNameProd ?? accountSecretNameBase ?? "blob-fallback");
+
+            _logger.LogInformation(
+                "Order requested CorrelationId={CorrelationId} domains={Domains} cert={CertName} staging={Staging} dryRun={DryRun} secretNameExpected={SecretNameExpected}",
+                correlationId,
+                string.Join(",", new[] { primaryDomain }.Concat(additional)),
+                certName,
+                staging,
+                dryRun,
+                expectedSecretName);
 
             var issuanceResult = await _orderService.IssueCertificateAsync(
                 correlationId,
@@ -103,7 +117,7 @@ public class OrderCertificateFunction
                 keyVaultName,
                 pfxPassword,
                 secretClient,
-                accountSecretName,
+                accountSecretNameBase,
                 msg => _logger.LogInformation(msg));
 
             var meta = issuanceResult.meta;

@@ -54,12 +54,14 @@ public class RegisterAccountFunction
                 ?? (Environment.GetEnvironmentVariable("LE_USE_STAGING")?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false);
 
             string? vaultName = Environment.GetEnvironmentVariable("KEYVAULT_NAME");
-            string? acctSecretName = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME");
+            string? acctSecretNameBase = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME");
+            string? acctSecretNameStaging = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_STAGING");
+            string? acctSecretNameProd = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_PROD");
             SecretClient? secretClient = null;
-            if (!string.IsNullOrWhiteSpace(vaultName) && !string.IsNullOrWhiteSpace(acctSecretName))
+            if (!string.IsNullOrWhiteSpace(vaultName) && !string.IsNullOrWhiteSpace(acctSecretNameBase))
                 secretClient = new SecretClient(new Uri($"https://{vaultName}.vault.azure.net/"), _credential);
 
-            var ensureResult = await _acme.EnsureAccountAsync(email, staging, secretClient, acctSecretName);
+            var ensureResult = await _acme.EnsureAccountAsync(email, staging, secretClient, acctSecretNameBase);
             var ctx = ensureResult.Context;
             var error = ensureResult.Error;
             var created = ensureResult.Created;
@@ -71,7 +73,10 @@ public class RegisterAccountFunction
             {
                 email,
                 staging,
-                created
+                created,
+                secretNameUsed = staging
+                    ? (acctSecretNameStaging ?? (acctSecretNameBase != null ? $"{acctSecretNameBase}-staging" : null))
+                    : (acctSecretNameProd ?? acctSecretNameBase)
             };
             return await WriteJson(req, _responses.Success(correlationId, result));
         }
