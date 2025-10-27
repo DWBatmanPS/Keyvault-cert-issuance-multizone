@@ -6,66 +6,113 @@ using Azure.Security.KeyVault.Secrets;
 using Certes;
 using Certes.Acme;
 using Keyvault_cert_issueance.Models;
+using Azure.Identity;
 
 namespace Keyvault_cert_issueance.Services;
 
 public class AcmeAccountService
 {
     private readonly ResponseFactory _responses;
+    private readonly SecretClient? _defaultSecretClient;
 
-    // Cache contexts by a composite key (secretName or fallback key).
+    // Cache contexts by secret name or ephemeral composite key.
     private static readonly ConcurrentDictionary<string, AcmeContext> _cache =
         new(StringComparer.OrdinalIgnoreCase);
 
-    public AcmeAccountService(ResponseFactory responses)
+    public AcmeAccountService(ResponseFactory responses, DefaultAzureCredential credential)
     {
         _responses = responses;
+
+        var kvName = Environment.GetEnvironmentVariable("KEYVAULT_NAME");
+        if (!string.IsNullOrWhiteSpace(kvName))
+        {
+            _defaultSecretClient = new SecretClient(new Uri($"https://{kvName}.vault.azure.net/"), credential);
+        }
     }
 
     private static Uri GetServer(bool staging) =>
         staging ? WellKnownServers.LetsEncryptStagingV2 : WellKnownServers.LetsEncryptV2;
 
+    private string ResolveAccountSecretName(bool staging, string? overrideName)
+    {
+        if (!string.IsNullOrWhiteSpace(overrideName))
+            return overrideName;
+
+        // Priority: explicit staging/prod env names > base env name > default fallback
+        if (staging)
+        {
+            var stagingEnv = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_STAGING");
+            if (!string.IsNullOrWhiteSpace(stagingEnv)) return stagingEnv;
+        }
+        else
+        {
+            var prodEnv = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_PROD");
+            if (!string.IsNullOrWhiteSpace(prodEnv)) return prodEnv;
+        }
+
+        var baseEnv = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME");
+        if (!string.IsNullOrWhiteSpace(baseEnv))
+            return staging ? $"{baseEnv}-staging" : baseEnv; // if using a single base name, append suffix for staging
+
+        return staging ? "acme-account-staging" : "acme-account-prod";
+    }
+
+    private async Task<KeyVaultSecret?> TryGetSecretAsync(SecretClient? client, string name)
+    {
+        if (client == null) return null;
+        try
+        {
+            return await client.GetSecretAsync(name);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            return null;
+        }
+    }
+
     /// <summary>
-    /// Ensures an ACME account exists (and returns its context).
+    /// Ensures a shared ACME account exists. If the secret exists, email may be blank.
+    /// If creating new (no secret found), email is required.
     /// </summary>
-    /// <param name="email">Account email (required).</param>
-    /// <param name="staging">Use staging server if true.</param>
-    /// <param name="secretClient">Key Vault secret client (optional; if null, an in-memory account is used).</param>
-    /// <param name="accountSecretName">Explicit secret name override.</param>
-    /// <returns>(Context, Error, Created)</returns>
     public async Task<(AcmeContext? Context, ApiError? Error, bool Created)> EnsureAccountAsync(
         string email,
         bool staging,
         SecretClient? secretClient,
         string? accountSecretName)
     {
-
-        var sc = secretClient ?? _defaultSecretClient; // whatever you use internally
-
+        var sc = secretClient ?? _defaultSecretClient;
+        var server = GetServer(staging);
         var secretName = ResolveAccountSecretName(staging, accountSecretName);
 
-        var existing = await TryGetSecretAsync(sc, secretName);
-        if (existing != null)
+        // If we already cached context for this secret, reuse.
+        if (_cache.TryGetValue(secretName, out var cachedCtx))
+            return (cachedCtx, null, false);
+
+        // Attempt to load existing secret (if we have a client).
+        var existingSecret = await TryGetSecretAsync(sc, secretName);
+        if (existingSecret != null)
         {
-            // Build ACME context from stored key, ignore provided email.
-            var keyPem = existing.Value;
-            var acctKey = KeyFactory.FromPem(keyPem);
-            var directory = staging ? WellKnownServers.LetsEncryptStagingV2 : WellKnownServers.LetsEncryptV2;
-            var ctx = new AcmeContext(directory, acctKey);
-            return (ctx, null, false);
+            var acctKey = KeyFactory.FromPem(existingSecret.Value);
+            var ctxLoaded = new AcmeContext(server, acctKey);
+            _cache[secretName] = ctxLoaded;
+            return (ctxLoaded, null, false);
         }
-        
+
+        // No stored account key. Need email to create account.
         if (string.IsNullOrWhiteSpace(email))
-            return (null, _responses.Error("validation", "Email is required."), false);
-
-        var server = GetServer(staging);
-
-        // If Key Vault not supplied: ephemeral in-memory account (still cached for reuse during process lifetime).
-        if (secretClient == null)
         {
-            string ephemeralKey = $"ephemeral::{(staging ? "staging" : "prod")}::{email}";
-            if (_cache.TryGetValue(ephemeralKey, out var cached))
-                return (cached, null, false);
+            return (null, _responses.Error(
+                "account_email_missing",
+                "ACME account email required for initial registration.",
+                "Provide email to RegisterAccount function or set LE_EMAIL/ACME_ACCOUNT_EMAIL."), false);
+        }
+
+        // If no SecretClient (local dev or intentionally ephemeral) -> ephemeral context
+        if (sc == null)
+        {
+            string ephemeralKey = $"ephemeral::{(staging ? "stg" : "prod")}::{email}";
+            if (_cache.TryGetValue(ephemeralKey, out var ephCtx))
+                return (ephCtx, null, false);
 
             try
             {
@@ -80,51 +127,19 @@ public class AcmeAccountService
             }
         }
 
-        // Resolve secret name precedence: explicit parameter > env > default
-        string envName = staging
-            ? Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_STAGING") ?? ""
-            : Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME") ?? "";
-
-        string secretName = accountSecretName
-            ?? (string.IsNullOrWhiteSpace(envName)
-                ? $"acme-account{(staging ? "-staging" : "-prod")}"
-                : envName);
-
-        // Return cached if available.
-        if (_cache.TryGetValue(secretName, out var cachedCtx))
-            return (cachedCtx, null, false);
-
-        // Attempt load existing secret.
+        // Create + persist new account key
         try
         {
-            KeyVaultSecret existing = await secretClient.GetSecretAsync(secretName);
-            var key = KeyFactory.FromPem(existing.Value);
-            var ctx = new AcmeContext(server, key);
-            // Light validation to ensure account key is valid.
-            _ = await ctx.Account();
+            var ctx = new AcmeContext(server);
+            await ctx.NewAccount(email, true);
+            var pem = ctx.AccountKey.ToPem();
+            await sc.SetSecretAsync(new KeyVaultSecret(secretName, pem));
             _cache[secretName] = ctx;
-            return (ctx, null, false);
-        }
-        catch (RequestFailedException rfEx) when (rfEx.Status == 404)
-        {
-            // Need to create a new account and store key.
-            try
-            {
-                var ctx = new AcmeContext(server);
-                await ctx.NewAccount(email, true);
-                var pem = ctx.AccountKey.ToPem();
-                await secretClient.SetSecretAsync(new KeyVaultSecret(secretName, pem));
-                _cache[secretName] = ctx;
-                return (ctx, null, true);
-            }
-            catch (Exception createEx)
-            {
-                return (null, _responses.Error("acme_account_create", "Failed creating ACME account.", createEx.Message), false);
-            }
+            return (ctx, null, true);
         }
         catch (Exception ex)
         {
-            return (null, _responses.Error("acme_account_load", "Failed loading ACME account.", ex.Message), false);
+            return (null, _responses.Error("acme_account_create", "Failed creating ACME account.", ex.Message), false);
         }
     }
 }

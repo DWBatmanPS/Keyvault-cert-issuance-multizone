@@ -85,8 +85,7 @@ public async Task<(CertificateMetadata? meta, ApiError? error)> IssueCertificate
 
         // Pass emailToUse instead of 'email' to EnsureAccountAsync:
         var acct = await _accountService.EnsureAccountAsync(emailToUse ?? "", staging, secretClient, accountSecretName);
-
-        var acct = await _accountService.EnsureAccountAsync(email, staging, secretClient, accountSecretName);
+        
         var acmeCtx = acct.Context;
         if (acct.Error != null) return (null, acct.Error);
         log?.Invoke($"[{correlationId}] ACME account {(acct.Created ? "created" : "loaded")} staging={staging}");
