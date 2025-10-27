@@ -39,6 +39,22 @@ public class AcmeAccountService
         SecretClient? secretClient,
         string? accountSecretName)
     {
+
+        var sc = secretClient ?? _defaultSecretClient; // whatever you use internally
+
+        var secretName = ResolveAccountSecretName(staging, accountSecretName);
+
+        var existing = await TryGetSecretAsync(sc, secretName);
+        if (existing != null)
+        {
+            // Build ACME context from stored key, ignore provided email.
+            var keyPem = existing.Value;
+            var acctKey = KeyFactory.FromPem(keyPem);
+            var directory = staging ? WellKnownServers.LetsEncryptStagingV2 : WellKnownServers.LetsEncryptV2;
+            var ctx = new AcmeContext(directory, acctKey);
+            return (ctx, null, false);
+        }
+        
         if (string.IsNullOrWhiteSpace(email))
             return (null, _responses.Error("validation", "Email is required."), false);
 

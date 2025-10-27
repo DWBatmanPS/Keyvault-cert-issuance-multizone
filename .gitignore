@@ -269,7 +269,7 @@ __azurite_db_blob__.json
 
 *.bicepparam
 
-.vscode/
+
 .config/
 __blobstorage__
 

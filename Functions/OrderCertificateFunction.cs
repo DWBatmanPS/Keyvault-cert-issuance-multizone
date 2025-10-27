@@ -1,10 +1,7 @@
 using System;
-using System.IO;
+using System.Collections.Generic;
 using System.Linq;
-using System.Text.Json;
 using System.Threading.Tasks;
-using Azure.Identity;
-using Azure.Security.KeyVault.Secrets;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
@@ -15,144 +12,213 @@ namespace Keyvault_cert_issueance.Functions;
 
 public class OrderCertificateFunction
 {
-    private readonly ILogger _logger;
-    private readonly CertificateOrderService _orderService;
+    private readonly ILogger _log;
+    private readonly ZoneConfigService _zones;
+    private readonly CertificateOrderService _orders;
+    private readonly RateLimiterService _rate;
     private readonly ResponseFactory _responses;
-    private readonly DefaultAzureCredential _credential;
 
     public OrderCertificateFunction(
-        ILoggerFactory loggerFactory,
-        CertificateOrderService orderService,
-        ResponseFactory responses,
-        DefaultAzureCredential credential)
+        ILoggerFactory lf,
+        ZoneConfigService zones,
+        CertificateOrderService orders,
+        RateLimiterService rate,
+        ResponseFactory responses)
     {
-        _logger = loggerFactory.CreateLogger<OrderCertificateFunction>();
-        _orderService = orderService;
+        _log = lf.CreateLogger<OrderCertificateFunction>();
+        _zones = zones;
+        _orders = orders;
+        _rate = rate;
         _responses = responses;
-        _credential = credential;
     }
 
-    [Function("OrderCertificate")]
+    // Bulk order all configured certificates (ignores renewal threshold; manual mass issuance).
+    // Optional query overrides: ?staging=true|false&dryRun=true|false
+    [Function("OrderAllCertificates")]
     public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+        [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = "order-all")] HttpRequestData req)
     {
         string correlationId = Guid.NewGuid().ToString("n");
         try
         {
-            var raw = await new StreamReader(req.Body).ReadToEndAsync();
-            OrderRequest? request = string.IsNullOrWhiteSpace(raw) ? null :
-                JsonSerializer.Deserialize<OrderRequest>(raw);
+            var qs = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
+            bool? stagingOverride = ParseNullableBool(qs.Get("staging"));
+            bool? dryRunOverride = ParseNullableBool(qs.Get("dryRun"));
 
-            string primaryDomain = request?.PrimaryDomain
-                ?? Environment.GetEnvironmentVariable("DOMAIN_NAME")
-                ?? "";
-            if (string.IsNullOrWhiteSpace(primaryDomain))
-                return await Fail(req, correlationId, "validation_error", "Primary domain required.");
+            bool forceReload = ParseNullableBool(qs.Get("reload")) == true;
+            if (forceReload)
+            {
+                _zones.Reload();
+                _log.LogInformation("Config cache reloaded CorrelationId={CorrelationId}", correlationId);
+            }
 
-            var additional = request?.AdditionalNames ??
-                (Environment.GetEnvironmentVariable("ADDITIONAL_NAMES")?
-                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                    ?? Array.Empty<string>());
+            var configs = _zones.GetAll().ToList();
+            if (configs.Count == 0)
+                return await Write(req, _responses.Success(correlationId, new
+                {
+                    message = "No zone/certificate configurations found.",
+                    total = 0,
+                    successes = 0,
+                    failures = 0,
+                    skippedRateLimit = 0,
+                    results = Array.Empty<object>()
+                }));
 
-            string certName = request?.CertificateName
-                ?? Environment.GetEnvironmentVariable("KEYVAULT_CERT_NAME")
-                ?? primaryDomain.Replace('.', '-');
+            _log.LogInformation("Bulk order start CorrelationId={CorrelationId} count={Count} stagingOverride={StagingOverride} dryRunOverride={DryRunOverride}",
+                correlationId, configs.Count, stagingOverride, dryRunOverride);
 
-            bool staging = request?.UseStaging
-                ?? (Environment.GetEnvironmentVariable("LE_USE_STAGING")?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false);
-            bool dryRun = request?.DryRun
-                ?? (Environment.GetEnvironmentVariable("LE_DRY_RUN")?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false);
-            bool cleanupDns = request?.CleanupDns
-                ?? (Environment.GetEnvironmentVariable("CLEANUP_DNS")?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false);
+            var results = new List<object>();
+            int successes = 0;
+            int failures = 0;
+            int skippedRate = 0;
 
-            int propagationMinutes = ParseIntEnv("MAX_PROPAGATION_MINUTES", 2, 1, 15);
-            int challengeMinutes = ParseIntEnv("MAX_CHALLENGE_MINUTES", 5, 1, 15);
+            foreach (var cfg in configs)
+            {
+                string itemCid = Guid.NewGuid().ToString("n");
+                bool rawEnvDry = Environment.GetEnvironmentVariable("LE_DRY_RUN")
+                    ?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false;
+                bool staging = stagingOverride ?? cfg.Staging;
+                bool dryRun = dryRunOverride ?? (cfg.DryRun ?? rawEnvDry);
 
-            string email = Environment.GetEnvironmentVariable("LE_EMAIL") ?? "";
-            string keyVaultName = Environment.GetEnvironmentVariable("KEYVAULT_NAME") ?? "";
-            string subscriptionId = Environment.GetEnvironmentVariable("AZURE_SUBSCRIPTION_ID") ?? "";
-            string resourceGroup = Environment.GetEnvironmentVariable("RESOURCE_GROUP") ?? "";
-            string dnsZone = Environment.GetEnvironmentVariable("DNS_ZONE") ?? "";
-            string? pfxPassword = Environment.GetEnvironmentVariable("PFX_PASSWORD");
-            string? accountSecretName = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME");
+                _log.LogInformation("EvalDryRun CorrelationId={CorrelationId} itemCid={ItemCid} cert={Cert} " +
+                                        "override={Override} cfgDryRun={CfgDryRun} envDryRun={EnvDryRun} final={FinalDryRun}",
+                        correlationId, itemCid, cfg.CertificateName, dryRunOverride, cfg.DryRun, rawEnvDry, dryRun);
 
-            if (new[] { keyVaultName, subscriptionId, resourceGroup, dnsZone }.Any(string.IsNullOrWhiteSpace))
-                return await Fail(req, correlationId, "validation_error", "Missing required environment variables for issuance.");
+                // Rate limit (skip if dry-run? Decide policy. Here we DO count; change if not desired.)
+                var rl = await _rate.CheckAndRecordAsync(cfg.DnsZone, cfg.CertificateName, "bulk-order", itemCid);
+                if (!rl.allowed)
+                {
+                    _log.LogWarning("Rate limit hit CorrelationId={CorrelationId} itemCid={ItemCid} cert={Cert} currentCount={Count}",
+                        correlationId, itemCid, cfg.CertificateName, rl.currentCount);
+                    skippedRate++;
+                    // Stop further processing to avoid repeated denials.
+                    results.Add(new
+                    {
+                        certificate = cfg.CertificateName,
+                        zone = cfg.Zone,
+                        itemCorrelationId = itemCid,
+                        status = "skipped_rate_limit",
+                        globalCount = rl.currentCount,
+                        retryAfter = rl.retryAfter?.TotalSeconds
+                    });
+                    break;
+                }
 
-            string? accountSecretNameBase    = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME");
-            string? accountSecretNameStaging = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_STAGING");
-            string? accountSecretNameProd    = Environment.GetEnvironmentVariable("ACCOUNT_KEY_SECRET_NAME_PROD");
+                var domainList = new[] { cfg.PrimaryDomain }
+                    .Concat(cfg.AdditionalNames ?? Array.Empty<string>())
+                    .Where(d => !string.IsNullOrWhiteSpace(d))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
 
-            SecretClient? secretClient = null;
-            if (!string.IsNullOrWhiteSpace(keyVaultName) && !string.IsNullOrWhiteSpace(accountSecretName))
-                secretClient = new SecretClient(new Uri($"https://{keyVaultName}.vault.azure.net/"), _credential);
+                    if (string.IsNullOrWhiteSpace(cfg.PrimaryDomain))
+                    {
+                        _log.LogWarning("Skipping cert due to empty primaryDomain CorrelationId={CorrelationId} cert={Cert} zone={Zone}",
+                            correlationId, cfg.CertificateName, cfg.Zone);
+                        results.Add(new {
+                            certificate = cfg.CertificateName,
+                            zone = cfg.Zone,
+                            itemCorrelationId = itemCid,
+                            status = "skipped_missing_primary_domain"
+                        });
+                        continue;
+                    }
 
-            var expectedSecretName = staging
-                ? (accountSecretNameStaging ?? (accountSecretNameBase != null ? $"{accountSecretNameBase}-staging" : "blob-fallback"))
-                : (accountSecretNameProd ?? accountSecretNameBase ?? "blob-fallback");
+                _log.LogInformation("Issuing CorrelationId={CorrelationId} itemCid={ItemCid} cert={Cert} domains={Domains} staging={Staging} dryRun={DryRun}",
+                    correlationId, itemCid, cfg.CertificateName,
+                    string.Join(",", domainList),
+                    staging, dryRun);
 
-            _logger.LogInformation(
-                "Order requested CorrelationId={CorrelationId} domains={Domains} cert={CertName} staging={Staging} dryRun={DryRun} secretNameExpected={SecretNameExpected}",
+                var globalEmail = Environment.GetEnvironmentVariable("LE_EMAIL");
+
+                var issuance = await _orders.IssueCertificateAsync(
+                    itemCid,
+                    globalEmail ?? string.Empty, // shared ACME account email (blank allowed if already registered)
+                    staging,
+                    dryRun,
+                    cfg.CleanupDns,
+                    cfg.PrimaryDomain,
+                    cfg.AdditionalNames ?? Array.Empty<string>(),
+                    cfg.CertificateName,
+                    cfg.SubscriptionId,
+                    cfg.ResourceGroup,
+                    cfg.DnsZone,
+                    cfg.PropagationMinutes,
+                    cfg.ChallengeMinutes,
+                    cfg.KeyVaultName,
+                    cfg.PfxPassword,
+                    secretClient: null,
+                    accountSecretName: null,
+                    log: m => _log.LogInformation(m));
+
+                if (issuance.error != null)
+                {
+                    failures++;
+                    _log.LogWarning("Issuance failed CorrelationId={CorrelationId} itemCid={ItemCid} cert={Cert} code={Code} msg={Message}",
+                        correlationId, itemCid, cfg.CertificateName, issuance.error.Code, issuance.error.Message);
+                    results.Add(new
+                    {
+                        certificate = cfg.CertificateName,
+                        zone = cfg.Zone,
+                        itemCorrelationId = itemCid,
+                        status = "failed",
+                        errorCode = issuance.error.Code,
+                        errorMessage = issuance.error.Message
+                    });
+                }
+                else
+                {
+                    successes++;
+                    results.Add(new
+                    {
+                        certificate = cfg.CertificateName,
+                        zone = cfg.Zone,
+                        itemCorrelationId = itemCid,
+                        status = "success",
+                        notBefore = issuance.meta!.NotBefore,
+                        notAfter = issuance.meta.NotAfter,
+                        domains = issuance.meta.Domains
+                    });
+                }
+            }
+
+            var payload = new
+            {
                 correlationId,
-                string.Join(",", new[] { primaryDomain }.Concat(additional)),
-                certName,
-                staging,
-                dryRun,
-                expectedSecretName);
+                total = configs.Count,
+                successes,
+                failures,
+                skippedRateLimit = skippedRate,
+                stagingOverride,
+                dryRunOverride,
+                results
+            };
 
-            var issuanceResult = await _orderService.IssueCertificateAsync(
-                correlationId,
-                email,
-                staging,
-                dryRun,
-                cleanupDns,
-                primaryDomain,
-                additional,
-                certName,
-                subscriptionId,
-                resourceGroup,
-                dnsZone,
-                propagationMinutes,
-                challengeMinutes,
-                keyVaultName,
-                pfxPassword,
-                secretClient,
-                accountSecretNameBase,
-                msg => _logger.LogInformation(msg));
-
-            var meta = issuanceResult.meta;
-            var error = issuanceResult.error;
-
-            if (error != null)
-                return await WriteJson(req, _responses.Failure<CertificateMetadata>(correlationId, error));
-
-            return await WriteJson(req, _responses.Success(correlationId, meta!));
+            return await Write(req, _responses.Success(correlationId, payload));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "OrderCertificate unexpected failure CorrelationId={CorrelationId}", correlationId);
-            return await WriteJson(req, _responses.Failure<object>(correlationId,
-                _responses.Error("internal_error", "Unexpected failure.", ex.Message)));
+            _log.LogError(ex, "Bulk order unexpected error CorrelationId={CorrelationId}", correlationId);
+            return await Write(req, _responses.Failure<object>(correlationId,
+                _responses.Error("internal", "Unexpected error during bulk order.", ex.Message)));
         }
     }
 
-    private static int ParseIntEnv(string name, int @default, int min, int max)
+    private static bool? ParseNullableBool(string? raw)
     {
-        var raw = Environment.GetEnvironmentVariable(name);
-        if (string.IsNullOrWhiteSpace(raw)) return @default;
-        if (!int.TryParse(raw, out var val)) return @default;
-        return Math.Clamp(val, min, max);
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        if (raw.Equals("true", StringComparison.OrdinalIgnoreCase)) return true;
+        if (raw.Equals("false", StringComparison.OrdinalIgnoreCase)) return false;
+        return null;
     }
 
-    private async Task<HttpResponseData> Fail(HttpRequestData req, string cid, string code, string message)
-        => await WriteJson(req, _responses.Failure<object>(cid, _responses.Error(code, message)));
-
-    private async Task<HttpResponseData> WriteJson<T>(HttpRequestData req, ApiResponse<T> payload)
+    private async Task<HttpResponseData> Write<T>(HttpRequestData req, ApiResponse<T> payload)
     {
         var resp = req.CreateResponse(payload.HasError
             ? System.Net.HttpStatusCode.BadRequest
             : System.Net.HttpStatusCode.OK);
-        await resp.WriteStringAsync(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+        await resp.WriteStringAsync(System.Text.Json.JsonSerializer.Serialize(
+            payload,
+            new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
         return resp;
     }
 }

@@ -1,22 +1,11 @@
-using Azure.Identity;
-using Azure.ResourceManager;
-using Azure.Security.KeyVault.Certificates;
-using Azure.Security.KeyVault.Secrets;
-using Azure.Storage.Blobs;
-using Microsoft.Azure.Functions.Worker;
-using Microsoft.Azure.Functions.Worker.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Keyvault_cert_issueance.Infrastructure;
 namespace Keyvault_cert_issueance.Models;
 
-public sealed class OrderRequest
+public class OrderRequest
 {
-    public string? PrimaryDomain { get; set; }
-    public string[]? AdditionalNames { get; set; }
-    public string? CertificateName { get; set; }
-    public bool? UseStaging { get; set; }
-    public bool? DryRun { get; set; }
-    public bool? CleanupDns { get; set; }
+    public string? Zone { get; set; }              // Zone identifier used to look up config
+    public string? CertificateName { get; set; }   // Certificate config key within the zone
+    public bool? UseStaging { get; set; }          // Optional override
+    public bool? DryRun { get; set; }              // Optional override
+    public bool? CleanupDns { get; set; }          // Optional override (otherwise cfg.CleanupDns)
+    // Optional future fields; primary/additional now come from config, so they’re omitted.
 }

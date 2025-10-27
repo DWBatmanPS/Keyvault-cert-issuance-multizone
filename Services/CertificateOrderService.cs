@@ -58,16 +58,34 @@ public async Task<(CertificateMetadata? meta, ApiError? error)> IssueCertificate
     allDomains.AddRange(additionalNames.Where(a => !string.Equals(a, primaryDomain, StringComparison.OrdinalIgnoreCase)));
     allDomains = allDomains.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
+    log?.Invoke($"[{correlationId}] Preparing issuance cert='{certificateName}' zone='{dnsZone}' staging={staging} dryRun={dryRun} domains={string.Join(",", allDomains)}");
+
     var invalid = allDomains.Where(d =>
         !d.Equals(dnsZone, StringComparison.OrdinalIgnoreCase) &&
         !d.EndsWith("." + dnsZone, StringComparison.OrdinalIgnoreCase)).ToList();
     if (invalid.Any())
+    {
+        log?.Invoke($"[{correlationId}] Domain validation failed. dnsZone='{dnsZone}' primary='{primaryDomain}' " +
+                        $"domains={string.Join(",", allDomains)} invalid={string.Join(",", invalid)}");
+
         return (null, _responses.Error("domain_validation", $"Domains outside zone '{dnsZone}'.", string.Join(", ", invalid)));
+
+    }
+    else
+    {
+        log?.Invoke($"[{correlationId}] Domain validation passed for zone '{dnsZone}'.");
+    }
 
     var sem = _locks.GetOrAdd(certificateName, _ => new System.Threading.SemaphoreSlim(1, 1));
     await sem.WaitAsync();
     try
     {
+        var globalEmail = Environment.GetEnvironmentVariable("LE_EMAIL");
+        var emailToUse = string.IsNullOrWhiteSpace(globalEmail) ? email : globalEmail;
+
+        // Pass emailToUse instead of 'email' to EnsureAccountAsync:
+        var acct = await _accountService.EnsureAccountAsync(emailToUse ?? "", staging, secretClient, accountSecretName);
+
         var acct = await _accountService.EnsureAccountAsync(email, staging, secretClient, accountSecretName);
         var acmeCtx = acct.Context;
         if (acct.Error != null) return (null, acct.Error);
@@ -86,9 +104,15 @@ public async Task<(CertificateMetadata? meta, ApiError? error)> IssueCertificate
             }, null);
         }
 
+        log?.Invoke($"[{correlationId}] Creating ACME order for domains count={allDomains.Count}");
+
         // Order + DNS challenges
         var order = await acmeCtx!.NewOrder(allDomains);
         var authzContexts = await order.Authorizations();
+        log?.Invoke($"[{correlationId}] Authz contexts retrieved count={(await order.Authorizations()).Count()}");
+
+        log?.Invoke($"[{correlationId}] Starting DNS challenge fulfillment subscription='{subscriptionId}' rg='{resourceGroup}' zone='{dnsZone}'");
+
         var dnsErr = await _dnsService.FulfillChallengesAsync(
             acmeCtx,
             authzContexts,
@@ -99,6 +123,9 @@ public async Task<(CertificateMetadata? meta, ApiError? error)> IssueCertificate
             propagationMinutes,
             challengeMinutes,
             log);
+
+        log?.Invoke($"[{correlationId}] DNS challenges validated; proceeding to CSR generation.");
+
         if (dnsErr != null) return (null, dnsErr);
 
         // CSR

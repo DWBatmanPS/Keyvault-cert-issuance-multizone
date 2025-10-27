@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Azure.Functions.Worker;
 using Keyvault_cert_issueance.Services;
+using Azure.ResourceManager;
 
 namespace Keyvault_cert_issueance;
 
@@ -20,6 +21,16 @@ public static class Program
             {
                 services.AddSingleton(new DefaultAzureCredential());
 
+                // ARM client (for DNS operations)
+                services.AddSingleton(sp =>
+                {
+                    var cred = sp.GetRequiredService<DefaultAzureCredential>();
+                    var sub = Environment.GetEnvironmentVariable("AZURE_SUBSCRIPTION_ID")
+                        ?? throw new InvalidOperationException("AZURE_SUBSCRIPTION_ID not set.");
+                    return new ArmClient(cred, sub);
+                });
+
+                // Shared TableServiceClient
                 services.AddSingleton(sp =>
                 {
                     var account = Environment.GetEnvironmentVariable("TABLE_STORAGE_ACCOUNT_NAME")
@@ -28,22 +39,25 @@ public static class Program
                     return new TableServiceClient(uri, sp.GetRequiredService<DefaultAzureCredential>());
                 });
 
-                services.AddSingleton(sp =>
+                // Zone config table (typed wrapper)
+                services.AddSingleton<ZoneConfigTableProvider>(sp =>
                 {
                     var svc = sp.GetRequiredService<TableServiceClient>();
-                    var cfgName = Environment.GetEnvironmentVariable("ZONE_CONFIG_TABLE") ?? "zoneconfigs";
-                    svc.CreateTableIfNotExists(cfgName);
-                    return svc.GetTableClient(cfgName);
+                    var name = Environment.GetEnvironmentVariable("ZONE_CONFIG_TABLE") ?? "zoneconfigs";
+                    svc.CreateTableIfNotExists(name);
+                    return new ZoneConfigTableProvider(svc.GetTableClient(name));
                 });
 
-                services.AddSingleton(sp =>
+                // Rate limit events table (typed wrapper)
+                services.AddSingleton<RateEventsTableProvider>(sp =>
                 {
                     var svc = sp.GetRequiredService<TableServiceClient>();
-                    var evtName = Environment.GetEnvironmentVariable("RATE_LIMIT_TABLE") ?? "issuanceevents";
-                    svc.CreateTableIfNotExists(evtName);
-                    return svc.GetTableClient(evtName);
+                    var name = Environment.GetEnvironmentVariable("RATE_LIMIT_TABLE") ?? "issuanceevents";
+                    svc.CreateTableIfNotExists(name);
+                    return new RateEventsTableProvider(svc.GetTableClient(name));
                 });
 
+                // Blob service / locks
                 services.AddSingleton(sp =>
                 {
                     var account = Environment.GetEnvironmentVariable("TABLE_STORAGE_ACCOUNT_NAME")
@@ -56,9 +70,17 @@ public static class Program
                     return blobSvc;
                 });
 
-                // Services
-                services.AddSingleton<ZoneConfigService>();
-                services.AddSingleton<RateLimiterService>();
+                // Services (inject correct tables)
+                services.AddSingleton<ZoneConfigService>(sp =>
+                {
+                    return new ZoneConfigService(sp.GetRequiredService<ZoneConfigTableProvider>().Table);
+                });
+
+                services.AddSingleton<RateLimiterService>(sp =>
+                {
+                    return new RateLimiterService(sp.GetRequiredService<RateEventsTableProvider>().Table);
+                });
+
                 services.AddSingleton<DistributedLockService>();
                 services.AddSingleton<ResponseFactory>();
                 services.AddSingleton<KeyVaultService>();
@@ -73,4 +95,16 @@ public static class Program
 
         host.Run();
     }
+}
+
+public sealed class ZoneConfigTableProvider
+{
+    public TableClient Table { get; }
+    public ZoneConfigTableProvider(TableClient table) => Table = table;
+}
+
+public sealed class RateEventsTableProvider
+{
+    public TableClient Table { get; }
+    public RateEventsTableProvider(TableClient table) => Table = table;
 }

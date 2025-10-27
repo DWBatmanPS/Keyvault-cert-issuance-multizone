@@ -19,7 +19,7 @@ public class RenewalDispatcherFunction
     }
 
     [Function("RenewalDispatcher")]
-    public async Task Run([TimerTrigger("0 15 * * * *")] TimerInfo timer) // every hour at HH:15
+    public async Task Run([TimerTrigger("0 0 */3 * * *")] TimerInfo timer) // every 3 hours
     {
         string correlationId = Guid.NewGuid().ToString("n");
         var configs = _zones.GetAll(); // implement GetAll() if needed
@@ -30,7 +30,7 @@ public class RenewalDispatcherFunction
                 var current = await _kv.GetCurrentCertificateAsync(cfg.KeyVaultName, cfg.CertificateName);
                 if (current.meta == null) continue;
                 var remaining = current.meta.NotAfter - DateTimeOffset.UtcNow;
-                if (remaining > TimeSpan.FromDays(cfg.RenewalThresholdDays)) continue;
+                if (remaining > TimeSpan.FromDays((double)cfg.renewalThresholdDays.GetValueOrDefault())) continue;
 
                 var rl = await _rate.CheckAndRecordAsync(cfg.DnsZone, cfg.CertificateName, "auto-renew", correlationId);
                 if (!rl.allowed)
