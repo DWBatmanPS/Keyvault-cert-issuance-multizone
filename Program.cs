@@ -6,6 +6,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.ApplicationInsights;
+using Microsoft.Extensions.Logging.ApplicationInsights;
 using Keyvault_cert_issueance.Services;
 using Azure.ResourceManager;
 
@@ -15,13 +17,25 @@ public static class Program
 {
     public static void Main(string[] args)
     {
+        var verbose = (Environment.GetEnvironmentVariable("LE_VERBOSE") ?? "")
+            .Equals("true", StringComparison.OrdinalIgnoreCase);
+
         var host = new HostBuilder()
-            .ConfigureFunctionsWorkerDefaults()
+            .ConfigureFunctionsWorkerDefaults() // no lambda -> avoids WorkerOptions mismatch
+            .ConfigureLogging(logging =>
+            {
+                logging.AddApplicationInsights(); // requires APPLICATIONINSIGHTS_CONNECTION_STRING
+                logging.SetMinimumLevel(verbose ? LogLevel.Trace : LogLevel.Information);
+                logging.AddFilter<ApplicationInsightsLoggerProvider>("", verbose ? LogLevel.Trace : LogLevel.Information);
+                logging.AddFilter("Keyvault_cert_issueance.Services.DnsChallengeService", LogLevel.Trace);
+                logging.AddFilter("Keyvault_cert_issueance.Services.CertificateOrderService", LogLevel.Trace);
+                logging.AddFilter("Keyvault_cert_issueance.Services.AcmeAccountService", LogLevel.Trace);
+            })
             .ConfigureServices(services =>
             {
+
                 services.AddSingleton(new DefaultAzureCredential());
 
-                // ARM client (for DNS operations)
                 services.AddSingleton(sp =>
                 {
                     var cred = sp.GetRequiredService<DefaultAzureCredential>();
@@ -30,7 +44,6 @@ public static class Program
                     return new ArmClient(cred, sub);
                 });
 
-                // Shared TableServiceClient
                 services.AddSingleton(sp =>
                 {
                     var account = Environment.GetEnvironmentVariable("TABLE_STORAGE_ACCOUNT_NAME")
@@ -39,7 +52,6 @@ public static class Program
                     return new TableServiceClient(uri, sp.GetRequiredService<DefaultAzureCredential>());
                 });
 
-                // Zone config table (typed wrapper)
                 services.AddSingleton<ZoneConfigTableProvider>(sp =>
                 {
                     var svc = sp.GetRequiredService<TableServiceClient>();
@@ -48,7 +60,6 @@ public static class Program
                     return new ZoneConfigTableProvider(svc.GetTableClient(name));
                 });
 
-                // Rate limit events table (typed wrapper)
                 services.AddSingleton<RateEventsTableProvider>(sp =>
                 {
                     var svc = sp.GetRequiredService<TableServiceClient>();
@@ -57,7 +68,6 @@ public static class Program
                     return new RateEventsTableProvider(svc.GetTableClient(name));
                 });
 
-                // Blob service / locks
                 services.AddSingleton(sp =>
                 {
                     var account = Environment.GetEnvironmentVariable("TABLE_STORAGE_ACCOUNT_NAME")
@@ -70,17 +80,8 @@ public static class Program
                     return blobSvc;
                 });
 
-                // Services (inject correct tables)
-                services.AddSingleton<ZoneConfigService>(sp =>
-                {
-                    return new ZoneConfigService(sp.GetRequiredService<ZoneConfigTableProvider>().Table);
-                });
-
-                services.AddSingleton<RateLimiterService>(sp =>
-                {
-                    return new RateLimiterService(sp.GetRequiredService<RateEventsTableProvider>().Table);
-                });
-
+                services.AddSingleton<ZoneConfigService>();
+                services.AddSingleton<RateLimiterService>();
                 services.AddSingleton<DistributedLockService>();
                 services.AddSingleton<ResponseFactory>();
                 services.AddSingleton<KeyVaultService>();
@@ -88,8 +89,6 @@ public static class Program
                 services.AddSingleton<AcmeAccountService>();
                 services.AddSingleton<CertificateOrderService>();
                 services.AddSingleton<RevocationService>();
-
-                services.AddLogging(lb => lb.SetMinimumLevel(LogLevel.Information));
             })
             .Build();
 

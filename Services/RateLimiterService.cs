@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using Azure.Data.Tables;
+using Keyvault_cert_issueance;
 
 namespace Keyvault_cert_issueance.Services;
 
@@ -14,9 +15,9 @@ public class RateLimiterService
     private DateTime _cacheTime;
     private int _cachedTotal;
 
-    public RateLimiterService(TableClient eventsTable)
+    public RateLimiterService(RateEventsTableProvider provider)
     {
-        _eventsTable = eventsTable;
+        _eventsTable = provider.Table;
         _maxEvents = int.TryParse(Environment.GetEnvironmentVariable("GLOBAL_MAX_3H"), out var m) ? m : 300;
     }
 

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Azure.Data.Tables;
 using Keyvault_cert_issueance.Models;
+using Keyvault_cert_issueance;
 
 namespace Keyvault_cert_issueance.Services;
 
@@ -27,9 +28,9 @@ public class ZoneConfigService
     private DateTime _lastLoad = DateTime.MinValue;
     private readonly TimeSpan _ttl = TimeSpan.FromMinutes(5);
 
-    public ZoneConfigService(TableClient zoneConfigTable)
+    public ZoneConfigService(ZoneConfigTableProvider provider)
     {
-        _table = zoneConfigTable;
+        _table = provider.Table;
     }
 
     public ZoneConfig? Get(string zone, string cert)

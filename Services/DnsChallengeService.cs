@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Threading.Tasks;
 using Azure;
 using Azure.ResourceManager;
@@ -11,29 +12,45 @@ using Certes.Acme; // IAuthorizationContext, IChallengeContext
 using Certes.Acme.Resource; // ChallengeStatus
 using DnsClient;
 using Keyvault_cert_issueance.Models;
+using Microsoft.Extensions.Logging;
 
 namespace Keyvault_cert_issueance.Services;
 
 public class DnsChallengeService
 {
     private readonly ArmClient _armClient;
+    private readonly ILogger _log;
 
-    public DnsChallengeService(ArmClient armClient)
+    private static readonly bool Verbose = (Environment.GetEnvironmentVariable("LE_VERBOSE") ?? "")
+        .Equals("true", StringComparison.OrdinalIgnoreCase);
+
+    private void LogDebug(string msg, params object[] args)
+    {
+        _log.LogDebug("DnsChallengeService constructed Verbose={VerboseFlag}", Verbose);
+        if (Verbose) _log.LogDebug(msg, args);
+    }
+
+    public DnsChallengeService(ArmClient armClient, ILogger<DnsChallengeService> log)
     {
         _armClient = armClient;
+        _log = log;
     }
 
     private (ApiError? error, DnsZoneResource? zone) GetZone(string subscriptionId, string resourceGroup, string dnsZone)
     {
+        LogDebug("GetZone start subscriptionId={Sub} resourcegroup={RG} dnsZone={Zone}",
+            subscriptionId, resourceGroup, dnsZone);
         try
         {
             var zoneId = new Azure.Core.ResourceIdentifier(
                 $"/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.Network/dnszones/{dnsZone}");
             var zone = _armClient.GetDnsZoneResource(zoneId);
+            LogDebug("Zone resource acquired id={Id}", zoneId);
             return (null, zone);
         }
         catch (Exception ex)
         {
+            _log.LogError(ex, "Failed to get DNS zone {Zone}", dnsZone);
             return (new ApiError
             {
                 Code = "dns_zone_error",
@@ -54,10 +71,16 @@ public class DnsChallengeService
         int challengeMinutes,
         Action<string>? log = null)
     {
+        _log.LogInformation("DnsChallengeService executing authzCount={Count} zone={Zone}", authzContexts.Count(), dnsZone); // unconditional probe
+
+        LogDebug("FulfillChallengesAsync start count={Count} dnsZone={Zone} cleanup={Cleanup} propagationMin={Prop} challengeMin={Chal}",
+            authzContexts.Count(), dnsZone, cleanup, propagationMinutes, challengeMinutes);
+
         var (err, zoneResource) = GetZone(subscriptionId, resourceGroup, dnsZone);
         if (err != null) return err;
 
         var txtCollection = zoneResource!.GetDnsTxtRecords();
+        LogDebug("Retrieved TXT record collection for zone={Zone}", dnsZone);
         var lookup = new LookupClient(new LookupClientOptions { Timeout = TimeSpan.FromSeconds(5), Retries = 2 });
 
         foreach (var authCtx in authzContexts)
@@ -71,10 +94,12 @@ public class DnsChallengeService
             // Domain from authorization resource (to know which record to create)
             var authResource = await authCtx.Resource();
             var domain = authResource.Identifier.Value;
+            LogDebug("Processing authorization domain={Domain}", domain);
 
             var dnsValue = acme.AccountKey.DnsTxt(dnsCtx.Token);
             var recordRelativeName = ComputeRecordRelativeName(domain, dnsZone);
             log?.Invoke($"Preparing TXT record for {domain} -> {recordRelativeName}");
+            LogDebug("Computed record name={Record} value={Value}", recordRelativeName, dnsValue);
 
             // Upsert TXT record
             DnsTxtRecordResource? existing = null;
@@ -86,18 +111,21 @@ public class DnsChallengeService
                     break;
                 }
             }
+            LogDebug("Existing record found={Found}", existing != null);
 
             if (existing == null)
             {
                 var data = new DnsTxtRecordData { TtlInSeconds = 60 };
                 data.DnsTxtRecords.Add(new DnsTxtRecordInfo { Values = { dnsValue } });
                 await txtCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, recordRelativeName, data);
+                LogDebug("Created TXT record {Record}", recordRelativeName);
             }
             else
             {
                 existing.Data.DnsTxtRecords.Clear();
                 existing.Data.DnsTxtRecords.Add(new DnsTxtRecordInfo { Values = { dnsValue } });
                 await existing.UpdateAsync(existing.Data);
+                LogDebug("Updated TXT record {Record}", recordRelativeName);
             }
 
             // Propagation polling
@@ -111,10 +139,14 @@ public class DnsChallengeService
                     if (q.Answers.TxtRecords().Any(a => a.Text.Any(t => t == dnsValue)))
                     {
                         propagated = true;
+                        LogDebug("Propagation success domain={Domain}", domain);
                         break;
                     }
                 }
-                catch { /* ignore transient */ }
+                catch (Exception ex)
+                {
+                    LogDebug("Lookup transient error domain={Domain} msg={Msg}", domain, ex.Message);
+                }
                 await Task.Delay(TimeSpan.FromSeconds(5));
             }
             if (!propagated)
@@ -122,6 +154,7 @@ public class DnsChallengeService
 
             // Ask ACME to validate this specific challenge
             await dnsCtx.Validate();
+            LogDebug("Requested challenge validation domain={Domain}", domain);
 
             // Poll challenge status
             var challengeDeadline = DateTime.UtcNow.AddMinutes(challengeMinutes);
@@ -131,6 +164,7 @@ public class DnsChallengeService
             {
                 await Task.Delay(TimeSpan.FromSeconds(4));
                 challengeRes = await dnsCtx.Resource();
+                LogDebug("Polling challenge status domain={Domain} status={Status}", domain, challengeRes.Status);
             }
 
             if (challengeRes.Status != ChallengeStatus.Valid)
@@ -145,14 +179,16 @@ public class DnsChallengeService
                     var toDelete = got.Value;
                     if (toDelete != null)
                         await toDelete.DeleteAsync(Azure.WaitUntil.Completed);
+                        LogDebug("Cleaned up TXT record {Record}", recordRelativeName);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // non-fatal
+                    LogDebug("Cleanup failed record={Record} msg={Msg}", recordRelativeName, ex.Message);
                 }
             }
         }
 
+        LogDebug("FulfillChallengesAsync completed successfully");
         return null;
     }
 
