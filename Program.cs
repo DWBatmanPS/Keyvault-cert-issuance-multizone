@@ -6,8 +6,6 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Azure.Functions.Worker;
-using Microsoft.Azure.Functions.Worker.ApplicationInsights;
-using Microsoft.Extensions.Logging.ApplicationInsights;
 using Keyvault_cert_issueance.Services;
 using Azure.ResourceManager;
 
@@ -21,18 +19,26 @@ public static class Program
             .Equals("true", StringComparison.OrdinalIgnoreCase);
 
         var host = new HostBuilder()
-            .ConfigureFunctionsWorkerDefaults() // no lambda -> avoids WorkerOptions mismatch
+            .ConfigureFunctionsWorkerDefaults() // Remove lambda - this fixes the WorkerOptions error
             .ConfigureLogging(logging =>
             {
-                logging.AddApplicationInsights(); // requires APPLICATIONINSIGHTS_CONNECTION_STRING
+                // Set global minimum level
                 logging.SetMinimumLevel(verbose ? LogLevel.Trace : LogLevel.Information);
-                logging.AddFilter<ApplicationInsightsLoggerProvider>("", verbose ? LogLevel.Trace : LogLevel.Information);
+                
+                // Configure specific category filters
+                logging.AddFilter("Keyvault_cert_issueance.Functions.OrderCertificateFunction", LogLevel.Debug);
                 logging.AddFilter("Keyvault_cert_issueance.Services.DnsChallengeService", LogLevel.Trace);
                 logging.AddFilter("Keyvault_cert_issueance.Services.CertificateOrderService", LogLevel.Trace);
                 logging.AddFilter("Keyvault_cert_issueance.Services.AcmeAccountService", LogLevel.Trace);
+                
+                // Add console logging for local development
+                logging.AddConsole();
+                logging.AddDebug();
             })
             .ConfigureServices(services =>
             {
+                // Add Application Insights for Azure Functions isolated worker
+                services.AddApplicationInsightsTelemetryWorkerService();
 
                 services.AddSingleton(new DefaultAzureCredential());
 

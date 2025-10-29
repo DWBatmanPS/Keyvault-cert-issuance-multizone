@@ -65,7 +65,7 @@ public class IssueCertificateFunction
                 cfg.AdditionalNames,
                 cfg.CertificateName,
                 cfg.SubscriptionId,
-                cfg.ResourceGroup,
+                cfg.zoneResourceGroup,
                 cfg.DnsZone,
                 cfg.PropagationMinutes,
                 cfg.ChallengeMinutes,

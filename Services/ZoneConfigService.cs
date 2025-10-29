@@ -94,7 +94,7 @@ public class ZoneConfigService
                 DnsZone = e.GetString("dnsZone") ?? zonePartition,
                 CertificateName = certName,
                 SubscriptionId = e.GetString("subscriptionId") ?? "",
-                ResourceGroup = e.GetString("resourceGroup") ?? "",
+                zoneResourceGroup = e.GetString("zoneResourceGroup") ?? "",
                 KeyVaultName = e.GetString("keyVaultName") ?? "",
                 Email = e.GetString("email"),
                 Staging = e.GetBoolean("staging") ?? false,

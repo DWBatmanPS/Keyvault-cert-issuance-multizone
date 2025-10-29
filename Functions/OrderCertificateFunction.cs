@@ -39,6 +39,11 @@ public class OrderCertificateFunction
         [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = "order-all")] HttpRequestData req)
     {
         string correlationId = Guid.NewGuid().ToString("n");
+
+        _log.LogInformation("OrderAllCertificates START correlationId={CorrelationId} method={Method} url={Url}", 
+        correlationId, req.Method, req.Url);
+
+        
         try
         {
             var qs = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
@@ -140,7 +145,7 @@ public class OrderCertificateFunction
                     cfg.AdditionalNames ?? Array.Empty<string>(),
                     cfg.CertificateName,
                     cfg.SubscriptionId,
-                    cfg.ResourceGroup,
+                    cfg.zoneResourceGroup,
                     cfg.DnsZone,
                     cfg.PropagationMinutes,
                     cfg.ChallengeMinutes,

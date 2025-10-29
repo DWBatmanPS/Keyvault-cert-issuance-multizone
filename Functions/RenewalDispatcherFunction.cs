@@ -42,7 +42,7 @@ public class RenewalDispatcherFunction
                 var orderResult = await _order.IssueCertificateAsync(
                     correlationId, cfg.Email, cfg.Staging, dryRun:false, cfg.CleanupDns,
                     cfg.PrimaryDomain, cfg.AdditionalNames, cfg.CertificateName,
-                    cfg.SubscriptionId, cfg.ResourceGroup, cfg.DnsZone,
+                    cfg.SubscriptionId, cfg.zoneResourceGroup, cfg.DnsZone,
                     cfg.PropagationMinutes, cfg.ChallengeMinutes,
                     cfg.KeyVaultName, cfg.PfxPassword, null, null,
                     msg => _log.LogInformation(msg));

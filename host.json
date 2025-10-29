@@ -2,19 +2,22 @@
   "version": "2.0",
   "logging": {
     "logLevel": {
-      "default": "Trace",
-      "Function": "Trace",
+      "default": "Information",
+      "Function": "Information",
       "Host.Results": "Information",
       "Keyvault_cert_issueance.Functions.OrderCertificateFunction": "Debug",
       "Keyvault_cert_issueance.Services.DnsChallengeService": "Trace",
       "Keyvault_cert_issueance.Services.CertificateOrderService": "Trace",
       "Keyvault_cert_issueance.Services.AcmeAccountService": "Trace",
-      "Host.Aggregator": "Debug"
+      "Host.Aggregator": "Information"
     },
     "applicationInsights": {
       "samplingSettings": {
-        "isEnabled": false
-      }
+        "isEnabled": false,
+        "excludedTypes": "Request"
+      },
+      "enableLiveMetricsFilters": true
     }
-  }
+  },
+  "functionTimeout": "00:10:00"
 }

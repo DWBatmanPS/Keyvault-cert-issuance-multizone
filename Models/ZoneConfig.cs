@@ -16,7 +16,7 @@ public class ZoneConfig
     public int ChallengeMinutes { get; set; } = 5;
     public string SubscriptionId { get; set; } = ""; // Interpreted as Key Vault subscription
     // If you later need a different subscription for the DNS zone, add: public string? DnsSubscriptionId { get; set; }
-    public string ResourceGroup { get; set; } = "";
+    public string zoneResourceGroup { get; set; } = "";
     public string? PfxPassword { get; set; }
     public int? renewalThresholdDays { get; set; } = 15;
     public bool? DryRun { get; set; }

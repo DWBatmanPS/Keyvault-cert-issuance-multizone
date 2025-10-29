@@ -74,7 +74,7 @@ public class RenewCertificateFunction
 
             string email = Environment.GetEnvironmentVariable("LE_EMAIL") ?? "";
             string subscriptionId = Environment.GetEnvironmentVariable("AZURE_SUBSCRIPTION_ID") ?? "";
-            string resourceGroup = Environment.GetEnvironmentVariable("RESOURCE_GROUP") ?? "";
+            string zoneResourceGroup = Environment.GetEnvironmentVariable("ZONE_RESOURCE_GROUP") ?? "";
             string dnsZone = Environment.GetEnvironmentVariable("DNS_ZONE") ?? "";
             bool staging = Environment.GetEnvironmentVariable("LE_USE_STAGING")?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false;
             bool dryRun = Environment.GetEnvironmentVariable("LE_DRY_RUN")?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false;
@@ -120,7 +120,7 @@ public class RenewCertificateFunction
                 extras,
                 certName,
                 subscriptionId,
-                resourceGroup,
+                zoneResourceGroup,
                 dnsZone,
                 propagationMinutes,
                 challengeMinutes,

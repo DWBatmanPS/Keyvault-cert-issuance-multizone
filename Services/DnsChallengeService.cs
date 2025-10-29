@@ -26,24 +26,26 @@ public class DnsChallengeService
 
     private void LogDebug(string msg, params object[] args)
     {
-        _log.LogDebug("DnsChallengeService constructed Verbose={VerboseFlag}", Verbose);
-        if (Verbose) _log.LogDebug(msg, args);
+        if (!Verbose) return;
+        _log.LogDebug(msg, args ?? Array.Empty<object>());
     }
 
     public DnsChallengeService(ArmClient armClient, ILogger<DnsChallengeService> log)
     {
         _armClient = armClient;
         _log = log;
+
+        _log.LogInformation("DnsChallengeService constructed Verbose={VerboseFlag}", Verbose);
     }
 
-    private (ApiError? error, DnsZoneResource? zone) GetZone(string subscriptionId, string resourceGroup, string dnsZone)
+    private (ApiError? error, DnsZoneResource? zone) GetZone(string subscriptionId, string zoneResourceGroup, string dnsZone)
     {
         LogDebug("GetZone start subscriptionId={Sub} resourcegroup={RG} dnsZone={Zone}",
-            subscriptionId, resourceGroup, dnsZone);
+            subscriptionId, zoneResourceGroup, dnsZone);
         try
         {
             var zoneId = new Azure.Core.ResourceIdentifier(
-                $"/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.Network/dnszones/{dnsZone}");
+                $"/subscriptions/{subscriptionId}/resourceGroups/{zoneResourceGroup}/providers/Microsoft.Network/dnszones/{dnsZone}");
             var zone = _armClient.GetDnsZoneResource(zoneId);
             LogDebug("Zone resource acquired id={Id}", zoneId);
             return (null, zone);
@@ -64,19 +66,20 @@ public class DnsChallengeService
         AcmeContext acme,
         IEnumerable<IAuthorizationContext> authzContexts,
         string subscriptionId,
-        string resourceGroup,
+        string zoneResourceGroup,
         string dnsZone,
         bool cleanup,
         int propagationMinutes,
         int challengeMinutes,
         Action<string>? log = null)
     {
-        _log.LogInformation("DnsChallengeService executing authzCount={Count} zone={Zone}", authzContexts.Count(), dnsZone); // unconditional probe
+        _log.LogInformation("DnsChallengeService.FulfillChallengesAsync START authzCount={Count} zone={Zone} subscription={Sub} rg={RG}", 
+        authzContexts.Count(), dnsZone, subscriptionId, zoneResourceGroup);
 
         LogDebug("FulfillChallengesAsync start count={Count} dnsZone={Zone} cleanup={Cleanup} propagationMin={Prop} challengeMin={Chal}",
-            authzContexts.Count(), dnsZone, cleanup, propagationMinutes, challengeMinutes);
+        authzContexts.Count(), dnsZone, cleanup, propagationMinutes, challengeMinutes);
 
-        var (err, zoneResource) = GetZone(subscriptionId, resourceGroup, dnsZone);
+        var (err, zoneResource) = GetZone(subscriptionId, zoneResourceGroup, dnsZone);
         if (err != null) return err;
 
         var txtCollection = zoneResource!.GetDnsTxtRecords();
